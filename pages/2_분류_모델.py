@@ -1,189 +1,384 @@
-# pages/2_분류_모델.py — 속성을 골라 두 모델을 학습하고, 두 축으로 자른 자리를 그림으로 본다
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from sklearn.dummy import DummyClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score
 from sklearn.tree import DecisionTreeClassifier
 
-st.set_page_config(page_title="분류 모델", page_icon="🤖", layout="wide")
-st.title("🤖 분류 모델")
-st.write("뇌졸중을 겪었는지 아닌지를 맞히는 모델 두 개를 만들고, 훈련 데이터와 테스트 데이터에서 정확도를 봅니다.")
+# ----------------------------------------------------------------------
+# 기본 설정
+# ----------------------------------------------------------------------
+PAGE_TITLE = "분류 모델"
+PAGE_ICON = "🌳"
 
-데이터주소 = "https://raw.githubusercontent.com/greatsong/modudata/main/data/stroke.csv"
-고를수있는열 = ["age", "avg_glucose_level", "bmi", "hypertension", "heart_disease"]
-기본열 = ["age", "avg_glucose_level", "hypertension", "heart_disease"]
-입력이름 = {"age": "나이", "avg_glucose_level": "평균 혈당", "bmi": "체질량지수",
-            "hypertension": "고혈압", "heart_disease": "심장병"}
-칸수 = 60
-칸색 = ["#e2e8f0", "#fef3c7", "#dbeafe", "#dcfce7", "#fae8ff", "#ffe4e6", "#ede9fe", "#f8fafc"]
+st.set_page_config(
+    page_title=f"{PAGE_TITLE} · 뇌졸중 예측 실습실",
+    page_icon=PAGE_ICON,
+    layout="wide",
+)
+
+DATA_URL = "https://raw.githubusercontent.com/greatsong/modudata/main/data/stroke.csv"
+
+COLOR_NO = "#7f9bbd"   # 뇌졸중 없음
+COLOR_YES = "#d1495b"  # 뇌졸중 있음
+REGION_NO = "#d9ead3"  # 트리 영역 - 없음
+REGION_YES = "#f4cccc"  # 트리 영역 - 있음
+
+RANDOM_STATE = 42
+
+ALL_FEATURES = ["age", "avg_glucose_level", "bmi", "hypertension", "heart_disease"]
+FEATURE_LABELS = {
+    "age": "나이",
+    "avg_glucose_level": "평균 혈당",
+    "bmi": "체질량지수",
+    "hypertension": "고혈압",
+    "heart_disease": "심장병",
+}
+DEFAULT_FEATURES = ["age", "avg_glucose_level", "hypertension", "heart_disease"]
+
+LR_NAME = "로지스틱 회귀(확률로 답하는 모델)"
+DT_NAME = "의사결정트리(질문으로 답하는 모델)"
+BASE_NAME = "기준 모델(입력을 보지 않고 다수결로 답하는 모델)"
 
 
+# ----------------------------------------------------------------------
+# 데이터 불러오기
+# ----------------------------------------------------------------------
 @st.cache_data
-def 데이터_읽기():
-    """번호 순으로 정렬해 둔다. 나누는 자리가 늘 같아야 점수를 비교할 수 있다."""
-    return pd.read_csv(데이터주소, encoding="utf-8").sort_values("id").reset_index(drop=True)
+def load_data(url: str) -> pd.DataFrame:
+    return pd.read_csv(url, encoding="utf-8")
 
 
-정식이름 = {"확률로 답하는 모델": "로지스틱 회귀", "질문으로 답하는 모델": "의사결정트리"}
+def split_train_test(data: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """번호(id) 순으로 정렬한 뒤 열 명씩 묶어, 각 묶음의 앞 세 명을 테스트용으로 고정한다."""
+    sorted_df = data.sort_values("id").reset_index(drop=True)
+    position_in_group = sorted_df.index % 10
+    test_mask = position_in_group < 3
+    test_df = sorted_df[test_mask].copy()
+    train_df = sorted_df[~test_mask].copy()
+    return train_df, test_df
 
 
-def 병기(이름):
-    """교과서의 정식 이름을 앞에 두고 교재에서 쓰는 이름을 괄호로 붙인다."""
-    return f"{정식이름[이름]}({이름})" if 이름 in 정식이름 else 이름
+def balance_training_data(train_df: pd.DataFrame, random_state: int = RANDOM_STATE) -> pd.DataFrame:
+    """뇌졸중이 있는 사람 수에 맞추어 없는 사람 수를 무작위로 골라 크기를 맞춘다."""
+    positive = train_df[train_df["stroke"] == 1]
+    negative = train_df[train_df["stroke"] == 0]
+    n = min(len(positive), len(negative))
+    balanced = pd.concat(
+        [
+            negative.sample(n=n, random_state=random_state),
+            positive.sample(n=n, random_state=random_state),
+        ]
+    )
+    return balanced.sample(frac=1, random_state=random_state).reset_index(drop=True)
 
 
-def 우리말(열):
-    return 입력이름[열]
+def build_tree_dot(tree_model: DecisionTreeClassifier, feature_cols: list, feature_labels: dict):
+    """의사결정트리를 graphviz DOT 문자열로 바꾼다. 마디마다 인원 수·뇌졸중 인원·비율을 적는다."""
+    tree = tree_model.tree_
+    lines = [
+        "digraph Tree {",
+        'graph [fontname="NanumGothic"];',
+        'node [shape=box, style="filled, rounded", fontname="NanumGothic", fontsize=12];',
+        'edge [fontname="NanumGothic", fontsize=11];',
+    ]
+    leaf_predictions = []
+    used_features = set()
+
+    def recurse(node_id: int):
+        n_samples = int(tree.n_node_samples[node_id])
+        stroke_count = int(tree.value[node_id][0][1])
+        ratio = stroke_count / n_samples * 100 if n_samples else 0.0
+        is_leaf = tree.children_left[node_id] == tree.children_right[node_id]
+
+        if is_leaf:
+            predicted = int(np.argmax(tree.value[node_id][0]))
+            leaf_predictions.append(predicted)
+            predicted_label = "있음" if predicted == 1 else "아님"
+            fill_color = REGION_YES if predicted == 1 else REGION_NO
+            label = (
+                f"답: {predicted_label}\\n"
+                f"인원 {n_samples}명 · 뇌졸중 {stroke_count}명 ({ratio:.1f}%)"
+            )
+            lines.append(f'n{node_id} [label="{label}", fillcolor="{fill_color}"];')
+        else:
+            feature_index = tree.feature[node_id]
+            feature_name = feature_cols[feature_index]
+            used_features.add(feature_name)
+            feature_label = feature_labels[feature_name]
+            threshold = tree.threshold[node_id]
+            label = (
+                f"{feature_label} ≤ {threshold:.1f} ?\\n"
+                f"인원 {n_samples}명 · 뇌졸중 {stroke_count}명 ({ratio:.1f}%)"
+            )
+            lines.append(f'n{node_id} [label="{label}", fillcolor="#ffffff"];')
+            left_id = tree.children_left[node_id]
+            right_id = tree.children_right[node_id]
+            lines.append(f'n{node_id} -> n{left_id} [label="예"];')
+            lines.append(f'n{node_id} -> n{right_id} [label="아니요"];')
+            recurse(left_id)
+            recurse(right_id)
+
+    recurse(0)
+    lines.append("}")
+    return "\n".join(lines), leaf_predictions, used_features
 
 
-df = 데이터_읽기()
-고른열 = st.multiselect("입력으로 사용할 속성", 고를수있는열, default=기본열, format_func=우리말)
-입력열 = [열 for 열 in 고를수있는열 if 열 in 고른열]   # 고른 차례와 상관없이 늘 같은 순서로 둔다
-if len(입력열) < 2:
-    st.warning("속성을 두 개 이상 골라 주세요. 하나만으로는 그림의 두 축을 만들 수 없습니다.")
+# ----------------------------------------------------------------------
+# 화면 시작
+# ----------------------------------------------------------------------
+st.title(f"{PAGE_ICON} {PAGE_TITLE}")
+st.caption("속성을 골라 뇌졸중을 예측하는 두 가지 모델을 만들고 비교해 봅니다.")
+
+try:
+    df = load_data(DATA_URL)
+except Exception as error:
+    st.error("데이터를 불러오지 못했습니다. 인터넷 연결을 확인해 주세요.")
+    st.caption(f"자세한 내용: {error}")
     st.stop()
 
-테스트용 = pd.Series(df.index % 10 < 3, index=df.index)   # 열 명씩 묶어 각 묶음의 앞 세 명이 테스트용
-X = df[입력열].copy()
-y = df["stroke"]                                        # 1이면 뇌졸중, 0이면 아님. 뇌졸중이 양성이다
-if "bmi" in 입력열 and X["bmi"].isna().any():
-    중앙값 = float(X.loc[~테스트용, "bmi"].median())
-    X["bmi"] = X["bmi"].fillna(중앙값)
-    st.warning(f"체질량지수가 비어 있는 사람은 훈련용의 중앙값 {중앙값:.1f}으로 채웠습니다.")
+# ---------------------------- 1. 속성 고르기 ----------------------------
+st.subheader("1. 입력으로 사용할 속성 고르기")
+
+options_kr = [FEATURE_LABELS[f] for f in ALL_FEATURES]
+default_kr = [FEATURE_LABELS[f] for f in DEFAULT_FEATURES]
+
+selected_kr = st.multiselect(
+    "모델이 뇌졸중을 예측할 때 볼 속성을 고르세요.",
+    options=options_kr,
+    default=default_kr,
+)
+selected_features = [f for f in ALL_FEATURES if FEATURE_LABELS[f] in selected_kr]
+
+if len(selected_features) < 2:
+    st.warning("속성을 두 개 이상 골라야 모델을 만들 수 있습니다.")
+    st.stop()
+
+st.caption("고른 속성: " + ", ".join(FEATURE_LABELS[f] for f in selected_features))
+
+# ---------------------------- 2. 데이터 나누고 준비하기 ----------------------------
+train_df, test_df = split_train_test(df)
+
+if "bmi" in selected_features:
+    median_bmi = train_df["bmi"].median()
+    train_df["bmi"] = train_df["bmi"].fillna(median_bmi)
+    test_df["bmi"] = test_df["bmi"].fillna(median_bmi)
+
+train_balanced = balance_training_data(train_df)
+
+st.caption(
+    f"테스트 데이터 {len(test_df):,}명 · 학습 데이터 {len(train_df):,}명"
+    f" (뇌졸중 없음 {int((train_df['stroke'] == 0).sum()):,}명,"
+    f" 있음 {int((train_df['stroke'] == 1).sum()):,}명)."
+    f" 크기를 맞춘 뒤에는 학습에 {len(train_balanced):,}명"
+    f" (없음/있음 각 {int((train_balanced['stroke'] == 1).sum()):,}명)을 사용합니다."
+)
+
+X_train_bal = train_balanced[selected_features]
+y_train_bal = train_balanced["stroke"]
+X_train_raw = train_df[selected_features]
+y_train_raw = train_df["stroke"]
+X_test = test_df[selected_features]
+y_test = test_df["stroke"]
+
+# ---------------------------- 3. 모델 학습 ----------------------------
+logistic_model = LogisticRegression(max_iter=1000, random_state=RANDOM_STATE)
+logistic_model.fit(X_train_bal, y_train_bal)
+
+tree_model = DecisionTreeClassifier(
+    max_depth=3,
+    min_samples_leaf=5,
+    random_state=RANDOM_STATE,
+)
+tree_model.fit(X_train_bal, y_train_bal)
+
+baseline_model = DummyClassifier(strategy="most_frequent")
+baseline_model.fit(X_train_raw, y_train_raw)
+
+train_acc_lr = accuracy_score(y_train_bal, logistic_model.predict(X_train_bal))
+test_acc_lr = accuracy_score(y_test, logistic_model.predict(X_test))
+
+train_acc_dt = accuracy_score(y_train_bal, tree_model.predict(X_train_bal))
+test_acc_dt = accuracy_score(y_test, tree_model.predict(X_test))
+
+train_acc_base = accuracy_score(y_train_raw, baseline_model.predict(X_train_raw))
+test_acc_base = accuracy_score(y_test, baseline_model.predict(X_test))
+
+# ---------------------------- 4. 정확도 카드 ----------------------------
+st.subheader("2. 모델 정확도 비교")
+
+card_lr, card_dt, card_base = st.columns(3)
 
 
-def 학습(열들):
-    """고른 열로 두 모델을 학습해 돌려준다. 설정은 늘 같다."""
-    훈련 = X.loc[~테스트용, 열들]
-    크기맞추기 = StandardScaler().fit(훈련)   # 크기 맞추기도 훈련용으로만 한다
-    확률모델 = LogisticRegression(max_iter=2000).fit(크기맞추기.transform(훈련), y[~테스트용])
-    # 질문으로 답하는 모델은 값의 크기에 영향받지 않으므로 크기를 맞추지 않은 값을 그대로 사용한다
-    질문모델 = DecisionTreeClassifier(max_depth=3, min_samples_leaf=5, random_state=0).fit(훈련, y[~테스트용])
-    return 크기맞추기, 확률모델, 질문모델
+def show_accuracy_card(container, title: str, test_acc: float, train_acc: float):
+    container.metric(title, f"{test_acc * 100:.2f}%")
+    container.caption(f"훈련 정확도 {train_acc * 100:.2f}% · 테스트 정확도 {test_acc * 100:.2f}%")
 
 
-크기맞추기, 확률모델, 질문모델 = 학습(입력열)
-많은쪽 = int(y[~테스트용].mode()[0])                       # 훈련용에서 사람이 많은 범주
-실제 = y[테스트용].to_numpy()
+show_accuracy_card(card_lr, LR_NAME, test_acc_lr, train_acc_lr)
+show_accuracy_card(card_dt, DT_NAME, test_acc_dt, train_acc_dt)
+show_accuracy_card(card_base, BASE_NAME, test_acc_base, train_acc_base)
 
-st.info(f"훈련용 {int((~테스트용).sum()):,}명(그중 뇌졸중 {int(y[~테스트용].sum()):,}명)으로 학습하고, "
-        f"테스트용 {int(테스트용.sum()):,}명(그중 실제 뇌졸중 {int(실제.sum()):,}명)으로 채점합니다.")
+st.divider()
 
-st.subheader("훈련 데이터와 테스트 데이터에서의 정확도")
-훈련답 = y[~테스트용].to_numpy()
-예측 = {"확률로 답하는 모델": 확률모델.predict(크기맞추기.transform(X[테스트용])),
-        "질문으로 답하는 모델": 질문모델.predict(X[테스트용]),
-        "한쪽으로만 답하는 모델": pd.Series(많은쪽, index=y[테스트용].index).to_numpy()}
-훈련예측 = {"확률로 답하는 모델": 확률모델.predict(크기맞추기.transform(X[~테스트용])),
-            "질문으로 답하는 모델": 질문모델.predict(X[~테스트용]),
-            "한쪽으로만 답하는 모델": pd.Series(많은쪽, index=y[~테스트용].index).to_numpy()}
-칸들 = st.columns(3)
-for 칸, (이름, 예측값) in zip(칸들, 예측.items()):
-    칸.metric(병기(이름), f"{(예측값 == 실제).mean():.4f}")
-    칸.caption(f"훈련용 {(훈련예측[이름] == 훈련답).mean():.4f} · 테스트용 {(예측값 == 실제).mean():.4f}")
-st.caption("큰 숫자가 테스트 데이터의 정확도입니다. 소수 넷째 자리까지 적었습니다. 맨 오른쪽은 입력을 하나도 "
-           "보지 않고 훈련용에서 사람이 많은 쪽으로만 답하는 모델입니다. 테스트용 세 값을 교재의 표에 적어 두세요.")
+# ---------------------------- 5. 산점도 + 경계선 + 트리 영역 ----------------------------
+st.subheader("3. 두 속성으로 보는 경계선과 나무의 영역")
 
-st.subheader("고른 속성 가운데 둘을 축으로 놓고 본다")
-축칸 = st.columns(2)
-가로 = 축칸[0].selectbox("가로축", 입력열, index=0, format_func=우리말)
-세로후보 = [열 for 열 in 입력열 if 열 != 가로]
-세로 = 축칸[1].selectbox("세로축", 세로후보, index=0, format_func=우리말)
+axis_left, axis_right = st.columns(2)
 
-채점입력 = X[테스트용]
-# 두 축이 아닌 속성은 테스트 데이터의 중앙값에 세워 둔다. 위에서 채점한 그 모델을 그대로 그린다
-고정값 = {열: float(채점입력[열].median()) for 열 in 입력열 if 열 not in (가로, 세로)}
+with axis_left:
+    x_label = st.selectbox(
+        "가로축으로 사용할 속성",
+        options=[FEATURE_LABELS[f] for f in selected_features],
+        index=0,
+        key="x_axis_select",
+    )
+x_col = [f for f in selected_features if FEATURE_LABELS[f] == x_label][0]
 
+remaining_for_y = [f for f in selected_features if f != x_col]
+with axis_right:
+    y_label = st.selectbox(
+        "세로축으로 사용할 속성",
+        options=[FEATURE_LABELS[f] for f in remaining_for_y],
+        index=0,
+        key="y_axis_select",
+    )
+y_col = [f for f in remaining_for_y if FEATURE_LABELS[f] == y_label][0]
 
-def 눈금(열):
-    """테스트용에서 가장 작은 값부터 가장 큰 값까지 고르게 나눈 값들을 돌려준다."""
-    작은값, 큰값 = float(채점입력[열].min()), float(채점입력[열].max())
-    큰값 = 큰값 if 큰값 > 작은값 else 작은값 + 1.0
-    return [작은값 + (큰값 - 작은값) * i / (칸수 - 1) for i in range(칸수)]
+other_features = [f for f in selected_features if f not in (x_col, y_col)]
+fixed_values = {f: float(test_df[f].median()) for f in other_features}
 
+if other_features:
+    fixed_text = ", ".join(
+        f"{FEATURE_LABELS[f]}은(는) {fixed_values[f]:.1f}" for f in other_features
+    )
+    st.caption(f"그림에 나오지 않는 속성은 테스트 데이터의 중앙값에 세워 두고 계산했습니다: {fixed_text}.")
+else:
+    st.caption("선택한 속성이 두 개뿐이라 따로 값을 고정할 속성이 없습니다.")
 
-def 두줄로(값들):   # 한 줄로 늘어선 값을 세로줄마다 잘라 표 모양으로 만든다
-    return [값들[i * 칸수:(i + 1) * 칸수] for i in range(칸수)]
+x_min, x_max = float(test_df[x_col].min()), float(test_df[x_col].max())
+y_min, y_max = float(test_df[y_col].min()), float(test_df[y_col].max())
 
+# ----- 의사결정트리 영역 칠하기 -----
+grid_steps = 80
+x_lin = np.linspace(x_min, x_max, grid_steps)
+y_lin = np.linspace(y_min, y_max, grid_steps)
+xx, yy = np.meshgrid(x_lin, y_lin)
 
-가로눈금, 세로눈금 = 눈금(가로), 눈금(세로)
-격자 = pd.DataFrame([dict(고정값, **{가로: 가, 세로: 세}) for 세 in 세로눈금 for 가 in 가로눈금])[입력열]
-확률격자 = 확률모델.predict_proba(크기맞추기.transform(격자))[:, 1].tolist()
-마디번호 = 질문모델.apply(격자).tolist()              # 각 자리가 나무의 어느 마디에 떨어지는지
-자리 = {마디: 번호 for 번호, 마디 in enumerate(sorted(set(마디번호)))}
-마디수 = len(자리)
-색단계 = [[(번호 + 끝) / 마디수, 칸색[번호 % len(칸색)]] for 번호 in range(마디수) for 끝 in (0, 1)]
+grid_df = pd.DataFrame({x_col: xx.ravel(), y_col: yy.ravel()})
+for f in other_features:
+    grid_df[f] = fixed_values[f]
+grid_df = grid_df[selected_features]
+grid_pred = tree_model.predict(grid_df).reshape(xx.shape)
 
-그림 = go.Figure()
-그림.add_trace(go.Heatmap(x=가로눈금, y=세로눈금, z=두줄로([자리[마디] for 마디 in 마디번호]),
-                          colorscale=색단계, zmin=-0.5, zmax=마디수 - 0.5, opacity=0.45,
-                          showscale=False, hoverinfo="skip"))
-그림.add_trace(go.Contour(x=가로눈금, y=세로눈금, z=두줄로(확률격자),
-                          contours=dict(coloring="lines", start=0.5, end=0.5, size=1),
-                          line=dict(width=3, color="#2563eb"), showscale=False, hoverinfo="skip"))
-점표 = pd.DataFrame({"가로": 채점입력[가로].to_numpy(), "세로": 채점입력[세로].to_numpy(),
-                     "실제": pd.Series(실제).map({1: "뇌졸중 있음", 0: "뇌졸중 없음"}).to_numpy()})
-for 이름, 색 in (("뇌졸중 없음", "#94a3b8"), ("뇌졸중 있음", "#7f1d1d")):
-    한그룹 = 점표[점표["실제"] == 이름]
-    그림.add_trace(go.Scatter(x=한그룹["가로"], y=한그룹["세로"], mode="markers", name=이름,
-                              marker=dict(size=6, color=색, opacity=0.5)))
-그림.update_layout(title=f"가로축 {우리말(가로)} · 세로축 {우리말(세로)}", xaxis_title=우리말(가로),
-                   yaxis_title=우리말(세로), height=560)
-st.plotly_chart(그림, width="stretch")
-if not (min(확률격자) <= 0.5 <= max(확률격자)):
-    st.info(f"이 그림 안에서 확률이 가장 높은 자리도 {max(확률격자):.2f}입니다. "
-            f"이 그림에서는 0.5 경계선이 보이지 않습니다.")
-고정설명 = " · ".join(f"{우리말(열)} {값:g}" for 열, 값 in 고정값.items())
-st.caption(f"점은 테스트 데이터이고 색은 실제 뇌졸중 여부입니다. 파란 선은 {병기('확률로 답하는 모델')}이 0.5로 가르는 자리, "
-           f"옅은 색으로 나뉜 바탕은 {병기('질문으로 답하는 모델')}이 두 축을 나눈 칸입니다. 위에서 채점한 그 모델을 그렸습니다."
-           + (f" 두 축이 아닌 속성은 테스트 데이터의 중앙값({고정설명})으로 고정해 계산했습니다." if 고정값 else ""))
+figure = go.Figure()
 
-st.subheader(f"{병기('질문으로 답하는 모델')}은 어떤 순서로 물었는가")
+figure.add_trace(
+    go.Contour(
+        x=x_lin,
+        y=y_lin,
+        z=grid_pred,
+        showscale=False,
+        colorscale=[[0, REGION_NO], [1, REGION_YES]],
+        opacity=0.35,
+        contours=dict(start=0, end=1, size=1),
+        line=dict(width=0),
+        hoverinfo="skip",
+        name="의사결정트리 영역",
+    )
+)
 
+# ----- 테스트 데이터 점 찍기 -----
+for label, color, value in [("뇌졸중 없음", COLOR_NO, 0), ("뇌졸중 있음", COLOR_YES, 1)]:
+    subset = test_df[test_df["stroke"] == value]
+    figure.add_trace(
+        go.Scatter(
+            x=subset[x_col],
+            y=subset[y_col],
+            mode="markers",
+            marker=dict(color=color, size=7, line=dict(width=0.5, color="white")),
+            name=label,
+        )
+    )
 
-def 가지그림(모델, 열들):
-    """학습한 나무를 가지가 갈라지는 그림으로 그린다.
+# ----- 로지스틱 회귀 경계선(0.5) -----
+coefs = logistic_model.coef_[0]
+intercept = logistic_model.intercept_[0]
+idx_x = selected_features.index(x_col)
+idx_y = selected_features.index(y_col)
+coef_x = coefs[idx_x]
+coef_y = coefs[idx_y]
+sum_fixed = intercept + sum(
+    coefs[selected_features.index(f)] * fixed_values[f] for f in other_features
+)
 
-    마디마다 그 자리에 온 훈련용 사람 수와 그중 실제 뇌졸중인 사람 수를 함께 적는다.
-    더 묻지 않고 답을 내는 마디는 답에 따라 색을 달리한다.
-    """
-    나무 = 모델.tree_
-    훈련 = X.loc[~테스트용, 열들]
-    지난자리 = 모델.decision_path(훈련).toarray()      # 사람마다 지나간 마디에 1이 선다
-    온사람 = 지난자리.sum(axis=0)
-    뇌졸중 = 지난자리[y[~테스트용].to_numpy() == 1].sum(axis=0)
+boundary_note = ""
+if abs(coef_y) > 1e-9:
+    line_x = np.linspace(x_min, x_max, 200)
+    line_y = -(sum_fixed + coef_x * line_x) / coef_y
+    inside = (line_y >= y_min) & (line_y <= y_max)
+    figure.add_trace(
+        go.Scatter(
+            x=line_x,
+            y=line_y,
+            mode="lines",
+            line=dict(color="black", width=2, dash="dash"),
+            name="로지스틱 회귀 경계선(0.5)",
+        )
+    )
+    if not inside.any():
+        boundary_note = "로지스틱 회귀의 경계선은 이 그림의 범위 밖에 있어 보이지 않습니다."
+elif abs(coef_x) > 1e-9:
+    x_value = -sum_fixed / coef_x
+    figure.add_trace(
+        go.Scatter(
+            x=[x_value, x_value],
+            y=[y_min, y_max],
+            mode="lines",
+            line=dict(color="black", width=2, dash="dash"),
+            name="로지스틱 회귀 경계선(0.5)",
+        )
+    )
+    if x_value < x_min or x_value > x_max:
+        boundary_note = "로지스틱 회귀의 경계선은 이 그림의 범위 밖에 있어 보이지 않습니다."
+else:
+    boundary_note = "이 두 속성만으로는 로지스틱 회귀의 경계선을 그릴 수 없습니다."
 
-    줄 = ['digraph {', 'graph [ranksep=0.45 nodesep=0.28];',
-          'node [shape=box style="filled,rounded" fontname="sans-serif" fontsize=13 '
-          'color="#cbd5e1" penwidth=1.2 margin="0.18,0.10"];',
-          'edge [fontname="sans-serif" fontsize=12 color="#94a3b8" fontcolor="#64748b"];']
-    for 마디 in range(나무.node_count):
-        인원 = int(온사람[마디])
-        환자 = int(뇌졸중[마디])
-        아래줄 = f"{인원:,}명\\n뇌졸중 {환자:,}명 · {환자 / 인원 * 100:.1f}%"
-        if 나무.children_left[마디] == -1:              # 더 묻지 않고 답을 내는 마디
-            답 = int(나무.value[마디][0].argmax())
-            윗줄 = "답: 뇌졸중" if 답 else "답: 아님"
-            칸색, 글자색 = ("#fecaca", "#7f1d1d") if 답 else ("#e2e8f0", "#334155")
-        else:
-            윗줄 = f"{입력이름[열들[나무.feature[마디]]]} ≤ {나무.threshold[마디]:.1f} ?"
-            칸색, 글자색 = "#ffffff", "#1e293b"
-        줄.append(f'{마디} [label="{윗줄}\n{아래줄}" fillcolor="{칸색}" fontcolor="{글자색}"];')
-        for 자식, 딱지 in ((나무.children_left[마디], "예"), (나무.children_right[마디], "아니요")):
-            if 자식 != -1:
-                줄.append(f'{마디} -> {자식} [label=" {딱지} "];')
-    return "\n".join(줄) + "\n}"
+figure.update_layout(
+    title=f"{FEATURE_LABELS[x_col]} vs {FEATURE_LABELS[y_col]}",
+    xaxis_title=FEATURE_LABELS[x_col],
+    yaxis_title=FEATURE_LABELS[y_col],
+    xaxis=dict(range=[x_min, x_max]),
+    yaxis=dict(range=[y_min, y_max]),
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+)
 
+st.plotly_chart(figure, use_container_width=True)
 
-st.graphviz_chart(가지그림(질문모델, 입력열))
+if boundary_note:
+    st.caption(boundary_note)
 
-마지막마디 = [마디 for 마디 in range(질문모델.tree_.node_count)
-              if 질문모델.tree_.children_left[마디] == -1]
-아님마디 = sum(1 for 마디 in 마지막마디 if int(질문모델.tree_.value[마디][0].argmax()) == 0)
-물은속성 = sorted({입력이름[입력열[열]] for 열 in 질문모델.tree_.feature if 열 >= 0})
-st.caption(f"맨 위가 첫 질문입니다. 예라고 답하면 왼쪽, 아니요라고 답하면 오른쪽으로 내려갑니다. "
-           f"색이 칠해진 마디가 더 묻지 않고 답을 내는 자리이고, 모두 {len(마지막마디)}개입니다. "
-           f"그중 {아님마디}개가 아님이라고 답합니다.")
-st.caption(f"고른 속성은 {len(입력열)}가지였지만 이 나무가 실제로 물은 것은 "
-           f"{' · '.join(물은속성)} {len(물은속성)}가지입니다.")
+st.divider()
+
+# ---------------------------- 6. 의사결정트리 가지 그림 ----------------------------
+st.subheader("4. 의사결정트리가 던진 질문")
+
+dot_text, leaf_predictions, used_features = build_tree_dot(
+    tree_model, selected_features, FEATURE_LABELS
+)
+st.graphviz_chart(dot_text)
+
+total_leaves = len(leaf_predictions)
+no_stroke_leaves = leaf_predictions.count(0)
+
+st.write(f"- 답을 내는 마디(잎)는 모두 {total_leaves}칸이고, 그중 {no_stroke_leaves}칸이 '아님'이라고 답합니다.")
+
+if used_features:
+    st.write("- 고른 속성 가운데 이 나무가 실제로 물은 것:")
+    for feature_name in selected_features:
+        if feature_name in used_features:
+            st.write(f"  - {FEATURE_LABELS[feature_name]}")
+else:
+    st.write("- 이 나무는 어떤 속성도 질문에 사용하지 않았습니다.")
